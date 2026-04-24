@@ -1,0 +1,7 @@
+{
+  "exec": "~/.config/waybar/scripts/zugbar",
+  "return": 0,
+  "interval": 2,
+  "on-click": "~/.config/waybar/scripts/zugbar cycle",
+  "tooltip": true
+}
