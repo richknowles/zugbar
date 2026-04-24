@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,47 +10,27 @@ import (
 	"strings"
 )
 
-// === CONFIGURATION ===
 const (
 	StateFile   = "/tmp/zugbar_state"
 	HistoryFile = "/tmp/zugbar_history"
+	CountersFile = "/tmp/zugbar_counters"
 	MaxHistory = 30
 )
 
-// DPI-independent block characters (21 levels)
-var blocks = []string{
-	"░", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█",
-	"█▁", "█▂", "█▃", "█▄", "█▅", "█▆", "█▇", "██",
-	"██▁", "██▂", "██▃", "███",
-}
-
-// Color thresholds
-var colors = []struct {
-	color     string
-	threshold int
-	name      string
-}{
-	{"#6272a4", 1024, "idle"},
-	{"#8be9fd", 10240, "light"},
-	{"#50fa7b", 102400, "moderate"},
-	{"#ffb86c", 524288, "heavy"},
-	{"#ff5555", 999999999, "extreme"},
-}
-
-// Target configuration
 type Target struct {
-	Name  string
-	Host  string
-	Label string
+	Name     string
+	Host    string
+	Iface   string
+	Label   string
+	IsLocal bool
 }
 
 var targets = []Target{
-	{Name: "BadBitch", Host: "10.0.0.15", Label: "BB"},
-	{Name: "Router", Host: "10.0.0.1", Label: "RTR"},
-	{Name: "Proxmox", Host: "10.0.0.2", Label: "PVE"},
+	{Name: "BadBitch", Host: "", Iface: "enp0s31f6", Label: "WIRED", IsLocal: true},
+	{Name: "EdgeRouter", Host: "10.0.0.1", Iface: "eth0", Label: "WAN", IsLocal: false},
+	{Name: "TOD", Host: "10.0.0.15", Iface: "vmbr0", Label: "TOD", IsLocal: false},
 }
 
-// === STATE ===
 func loadState() int {
 	data, err := os.ReadFile(StateFile)
 	if err != nil {
@@ -72,86 +53,141 @@ func cycleState() {
 	saveState(next)
 }
 
-func loadHistory() []int {
-	data, err := os.ReadFile(HistoryFile)
+func getInterfaceStats(host, iface string, isLocal bool) (rx, tx int64, online bool) {
+	if isLocal {
+		cmd := exec.Command("cat", "/proc/net/dev")
+		out, err := cmd.Output()
+		if err != nil {
+			return 0, 0, false
+		}
+		re := regexp.MustCompile(fmt.Sprintf(`%s:\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)`, iface))
+		matches := re.FindStringSubmatch(string(out))
+		if matches != nil {
+			rx, _ = strconv.ParseInt(matches[1], 10, 64)
+			tx, _ = strconv.ParseInt(matches[2], 10, 64)
+			return rx, tx, true
+		}
+		return 0, 0, false
+	}
+
+	cmd := exec.Command("ssh", "-o", "ConnectTimeout=2", "-o", "StrictHostKeyChecking=no", fmt.Sprintf("root@%s", host), "cat", "/proc/net/dev")
+	out, err := cmd.Output()
 	if err != nil {
-		return make([]int, MaxHistory)
+		return 0, 0, false
 	}
-	var history []int
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if val, err := strconv.Atoi(line); err == nil {
-			history = append(history, val)
-		}
+
+	re := regexp.MustCompile(fmt.Sprintf(`%s:\s+(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)`, iface))
+	matches := re.FindStringSubmatch(string(out))
+	if matches != nil {
+		rx, _ = strconv.ParseInt(matches[1], 10, 64)
+		tx, _ = strconv.ParseInt(matches[2], 10, 64)
+		return rx, tx, true
 	}
-	// Pad to MaxHistory
-	for len(history) < MaxHistory {
-		history = append([]int{0}, history...)
-	}
-	return history
+	return 0, 0, false
 }
 
-func saveHistory(history []int) {
-	lines := make([]string, len(history))
-	for i, v := range history {
-		lines[i] = strconv.Itoa(v)
+var prevStats = make(map[string]struct{ rx, tx int64 })
+
+func saveCounters() {
+	var lines []string
+	for k, v := range prevStats {
+		lines = append(lines, fmt.Sprintf("%s:%d:%d", k, v.rx, v.tx))
 	}
-	os.WriteFile(HistoryFile, []byte(strings.Join(lines, "\n")), 0644)
+	if len(lines) > 0 {
+		os.WriteFile(CountersFile, []byte(strings.Join(lines, "\n")), 0644)
+	}
 }
 
-// === PING ===
-func ping(host string) (int, bool) {
-	// Get all output and search for the time= pattern in the correct lines
-	cmd := exec.Command("ping", "-c", "1", "-W", "2", host)
-	output, err := cmd.Output()
+func loadCounters() {
+	data, err := os.ReadFile(CountersFile)
 	if err != nil {
-		return 0, false
+		return
 	}
-	
-	outputStr := string(output)
-	
-	// Split into lines and find the one with "from" and "time="
-	lines := strings.Split(outputStr, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "from") && strings.Contains(line, "time=") {
-			re := regexp.MustCompile(`time[=<](\d+\.?\d*)`)
-			matches := re.FindStringSubmatch(line)
-			if matches != nil {
-ms, _ := strconv.ParseFloat(matches[1], 64)
-	return int(ms * 1000), true // Convert to microseconds (e.g. 0.435ms -> 435us)
-			}
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Split(line, ":")
+		if len(parts) == 3 {
+			rx, _ := strconv.ParseInt(parts[1], 10, 64)
+			tx, _ := strconv.ParseInt(parts[2], 10, 64)
+			prevStats[parts[0]] = struct{ rx, tx int64 }{rx, tx}
 		}
 	}
-	
-	return 0, false
 }
 
-// === SPARKLINE ===
-func getBlock(val, max int) string {
-	if val == 0 {
-		return blocks[0]
+func getBandwidth(host, iface string, isLocal bool) (rxbps, txbps int64, online bool) {
+	rx, tx, ok := getInterfaceStats(host, iface, isLocal)
+	if !ok {
+		return 0, 0, false
 	}
-	level := (val * len(blocks)) / max
-	if level >= len(blocks) {
-		level = len(blocks) - 1
-	}
-	return blocks[level]
-}
 
-func getColor(val int) string {
-	for _, c := range colors {
-		if val <= c.threshold {
-			return c.color
+	key := host + iface
+	if host == "" {
+		key = "local" + iface
+	}
+	if prev, exists := prevStats[key]; exists {
+		rxbps = rx - prev.rx
+		txbps = tx - prev.tx
+		if rxbps < 0 {
+			rxbps = 0
+		}
+		if txbps < 0 {
+			txbps = 0
 		}
 	}
-	return colors[len(colors)-1].color
+	prevStats[key] = struct{ rx, tx int64 }{rx, tx}
+
+	return rxbps, txbps, true
 }
 
-// === OUTPUT ===
+func formatBytes(b int64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%dB", b)
+	}
+	if b < 1024*1024 {
+		return fmt.Sprintf("%.0fKB", float64(b)/1024)
+	}
+	if b < 1024*1024*1024 {
+		return fmt.Sprintf("%.1fMB", float64(b)/(1024*1024))
+	}
+	return fmt.Sprintf("%.1fGB", float64(b)/(1024*1024*1024))
+}
+
+func getStatusClass(rxbps, txbps int64) string {
+	total := rxbps + txbps
+	if total < 1024 {
+		return "idle"
+	}
+	if total < 1024*1024 {
+		return "light"
+	}
+	if total < 10*1024*1024 {
+		return "medium"
+	}
+	if total < 100*1024*1024 {
+		return "heavy"
+	}
+	return "extreme"
+}
+
+func getLevel(rxbps, txbps int64) string {
+	if rxbps == 0 && txbps == 0 {
+		return strings.Repeat("-", 20)
+	}
+	total := rxbps + txbps
+	level := int((total * 20) / (100 * 1024 * 1024))
+	if level > 20 {
+		level = 20
+	}
+	bar := ""
+	for i := 0; i < 20; i++ {
+		if i < level {
+			bar += "#"
+		} else {
+			bar += "-"
+		}
+	}
+	return bar
+}
+
 type WaybarOutput struct {
 	Text   string `json:"text"`
 	Tooltip string `json:"tooltip"`
@@ -159,14 +195,36 @@ type WaybarOutput struct {
 }
 
 func main() {
-	// Check for cycle command
+	loadCounters()
+
 	if len(os.Args) > 1 && os.Args[1] == "cycle" {
 		cycleState()
 		fmt.Println("Cycled to next target")
 		return
 	}
 
-	// Load state
+	// Handle "set N" command for keyboard shortcuts
+	if len(os.Args) > 1 && os.Args[1] == "set" {
+		if len(os.Args) > 2 {
+			targetNum := os.Args[2]
+			idx, err := strconv.Atoi(targetNum)
+			if err == nil {
+				saveState(idx)
+				// Also update counters for new target to avoid stale data
+				target := targets[idx]
+				rx, tx, _ := getInterfaceStats(target.Host, target.Iface, target.IsLocal)
+				key := target.Host + target.Iface
+				if target.IsLocal {
+					key = "local" + target.Iface
+				}
+				prevStats[key] = struct{ rx, tx int64 }{rx, tx}
+				saveCounters()
+				fmt.Println("Set to target", idx)
+			}
+		}
+		return
+	}
+
 	idx := loadState()
 	if idx >= len(targets) {
 		idx = 0
@@ -174,78 +232,29 @@ func main() {
 
 	target := targets[idx]
 
-	// Ping
-	latency, online := ping(target.Host)
+	rxbps, txbps, online := getBandwidth(target.Host, target.Iface, target.IsLocal)
 
-	// Load and update history
-	history := loadHistory()
-	history = append([]int{latency}, history...)
-	if len(history) > MaxHistory {
-		history = history[:MaxHistory]
-	}
-
-	// Calculate average
-	sum := 0
-	for _, v := range history[:10] {
-		sum += v
-	}
-	avg := sum / 10
-
-	// Save
+	saveCounters()
 	saveState(idx)
-	saveHistory(history)
 
-	// Build sparkline
-	max := avg * 2
-	if max < 10000 {
-		max = 10000
-	}
-
-	sparkline := ""
-	for _, v := range history[:15] {
-		color := getColor(v)
-		block := getBlock(v, max)
-		sparkline += fmt.Sprintf("<span color='%s'>%s</span>", color, block)
-	}
-
-	// Status
-	var statusIcon, statusClass, statusText, latencyStr string
+	var statusIcon, statusClass, statusText string
 	if online {
-		latencyMs := float64(latency) / 1000.0
-		if latencyMs < 0.5 {
-			statusIcon = "●"
-			statusClass = "good"
-			statusText = "Online"
-			latencyStr = fmt.Sprintf("%.2fms", latencyMs)
-		} else if latencyMs < 2.0 {
-			statusIcon = "◐"
-			statusClass = "medium"
-			statusText = "Online"
-			latencyStr = fmt.Sprintf("%.1fms", latencyMs)
-		} else if latencyMs < 50.0 {
-			statusIcon = "◑"
-			statusClass = "slow"
-			statusText = "Online"
-			latencyStr = fmt.Sprintf("%.0fms", latencyMs)
-		} else {
-			statusIcon = "○"
-			statusClass = "offline"
-			statusText = "High Latency"
-			latencyStr = fmt.Sprintf("%.0fms", latencyMs)
-		}
+		statusIcon = ">"
+		statusClass = getStatusClass(rxbps, txbps)
+		statusText = "Up"
 	} else {
-		statusIcon = "○"
+		statusIcon = "X"
 		statusClass = "offline"
 		statusText = "Offline"
-		latencyStr = "-"
 	}
 
-	// Format output
-	text := fmt.Sprintf("%s<span color='%s'>%s</span> %s",
-		statusIcon, getColor(latency), target.Label, sparkline)
+	rxStr := formatBytes(rxbps)
+	txStr := formatBytes(txbps)
+	level := getLevel(rxbps, txbps)
+	text := fmt.Sprintf("%s %s %s DL:%s UL:%s", statusIcon, target.Label, level, rxStr, txStr)
 
-	tooltip := fmt.Sprintf("Target: %s\nHost: %s\nStatus: %s\nLatency: %s\nAvg: %.1fms\n\nClick to cycle next target",
-		target.Name, target.Host, statusText, latencyStr, float64(avg)/1000)
+	tooltip := fmt.Sprintf("Target: %s\\nInterface: %s\\nStatus: %s\\nDownload: %s\\nUpload: %s\\n\\nClick to cycle next target",
+		target.Name, target.Iface, statusText, rxStr, txStr)
 
 	output := WaybarOutput{
 		Text:   text,
@@ -253,16 +262,9 @@ func main() {
 		Class:   "zugbar-" + statusClass,
 	}
 
-	// Print JSON
-	fmt.Printf("{\"text\": \"%s\", \"tooltip\": \"%s\", \"class\": \"%s\"}\n",
-		escapeHTML(output.Text),
-		escapeHTML(output.Tooltip),
-		output.Class)
-}
-
-func escapeHTML(s string) string {
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	return s
+	buf := new(strings.Builder)
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	enc.Encode(output)
+	fmt.Print(buf.String())
 }
