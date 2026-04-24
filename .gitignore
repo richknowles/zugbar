@@ -4,6 +4,9 @@ build/
 *.o
 *.so
 
+# Binary
+zugbar
+
 # Editor files
 .idea/
 .vscode/
