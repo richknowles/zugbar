@@ -1,3 +1,22 @@
+<h1 align="center">
+  ⚡ zugbar
+</h1>
+
+<p align="center">
+  <img src="ScreenRecording_05-01-2026 07-51-28_1.gif" alt="Zugbar network monitor demo" width="600"/>
+</p>
+
+<p align="center">
+  <strong>Network monitoring that flows like electricity</strong><br>
+  Stackable Waybar widget with iOS-style cycling and sparkline visualization
+</p>
+
+<p align="center">
+  Built for CachyOS & Hyprland ⚡🇨🇭
+</p>
+
+---
+
 # zugbar
 
 Stackable network monitoring widget for waybar with iOS-style cycling.
