@@ -3,7 +3,7 @@
 </h1>
 
 <p align="center">
-  <img src="ScreenRecording_05-01-2026 07-51-28_1.gif" alt="Zugbar network monitor demo" width="600"/>
+  <img src="zugbar-demo-github.gif" alt="Zugbar network monitor demo" width="600"/>
 </p>
 
 <p align="center">
